@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>優化後的SGD示例：多個樣本</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            text-align: center;
+            margin: 20px;
+        }
+        .slider {
+            width: 300px;
+        }
+        .charts-container {
+            display: flex;
+            justify-content: center;
+            align-items: start;
+            gap: 20px;
+            margin-top: 20px;
+        }
+        #chart-container {
+            width: 500px;
+            height: 400px;
+        }
+        #plotly-container {
+            width: 500px;
+            height: 400px;
+        }
+        #error-message {
+            color: red;
+            font-weight: bold;
+        }
+        #loading {
+            display: none;
+            color: blue;
+            font-weight: bold;
+        }
+        .content {
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <div id="loading">加載中，請稍候...</div>
+    <div id="error-message"></div>
+    
+    <div class="content">
+        <h2>訓練的模型: 房子價格 = m<sub>1</sub> * 房間數 + m<sub>2</sub> * 房間大小 + b</h2>
+        <h2>與真實值的差距: Σ(Y<sub>Predict</sub> - Y<sub>True</sub>)<sup>2</sup></h2>
+        
+        <div>
+            <label for="m1">參數 (m1):</label>
+            <input type="range" id="m1" class="slider" min="-10" max="10" step="0.1" value="1">
+            <span id="m1-value">1</span>
+        </div>
+        <div>
+            <label for="m2">參數 (m2):</label>
+            <input type="range" id="m2" class="slider" min="-10" max="10" step="0.1" value="1">
+            <span id="m2-value">1</span>
+        </div>
+        <div>
+            <label for="b">參數 (b):</label>
+            <input type="range" id="b" class="slider" min="-10" max="10" step="0.1" value="1">
+            <span id="b-value">1</span>
+        </div>
+        <div>
+            <h2>與真實值的差距: <span id="loss">0</span></h2>
+        </div>
+
+        <div class="charts-container">
+            <div id="chart-container">
+                <canvas id="lossChart"></canvas>
+            </div>
+            <div id="plotly-container"></div>
+        </div>
+    </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            const errorMessageElement = document.getElementById('error-message');
+            const loadingElement = document.getElementById('loading');
+            const contentElement = document.querySelector('.content');
+
+            // 改進的腳本加載函數
+            function loadScript(urls, name) {
+                loadingElement.style.display = 'block';
+                return new Promise((resolve, reject) => {
+                    let errors = 0;
+                    function tryLoad(index) {
+                        if (index >= urls.length) {
+                            reject(new Error(`Failed to load ${name} from all sources`));
+                            return;
+                        }
+
+                        const script = document.createElement('script');
+                        script.src = urls[index];
+                        script.onload = resolve;
+                        script.onerror = () => {
+                            errors++;
+                            if (errors > 2) {
+                                console.warn(`Failed to load ${name} from ${urls[index]}, trying next source...`);
+                            }
+                            tryLoad(index + 1);
+                        };
+                        document.head.appendChild(script);
+                    }
+
+                    tryLoad(0);
+                });
+            }
+
+            // 主程序
+            async function main() {
+                try {
+                    // 加載必要的腳本，使用多個回退選項
+                    await loadScript([
+                        'https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js',
+                        'https://unpkg.com/chart.js@3.9.1/dist/chart.min.js',
+                        'https://cdn.jsdelivr.net/npm/chart.js@3.9.1/dist/chart.min.js'
+                    ], 'Chart.js');
+                    
+                    await loadScript([
+                        'https://cdnjs.cloudflare.com/ajax/libs/plotly.js/2.24.1/plotly.min.js',
+                        'https://unpkg.com/plotly.js@2.24.1/dist/plotly.min.js',
+                        'https://cdn.plot.ly/plotly-2.24.1.min.js'
+                    ], 'Plotly.js');
+
+                    // 確認腳本已正確加載
+                    if (typeof Chart === 'undefined' || typeof Plotly === 'undefined') {
+                        throw new Error('Failed to load Chart.js or Plotly.js');
+                    }
+
+                    // 隱藏加載提示，顯示內容
+                    loadingElement.style.display = 'none';
+                    contentElement.style.display = 'block';
+
+                    // 獲取 DOM 元素
+                    const m1Slider = document.getElementById('m1');
+                    const m2Slider = document.getElementById('m2');
+                    const bSlider = document.getElementById('b');
+                    const m1Value = document.getElementById('m1-value');
+                    const m2Value = document.getElementById('m2-value');
+                    const bValue = document.getElementById('b-value');
+                    const lossDisplay = document.getElementById('loss');
+                    const ctx = document.getElementById('lossChart').getContext('2d');
+
+                    let step = 0;
+                    const steps = Array.from({length: 1000}, (_, i) => i + 1);
+                    const losses = Array(1000).fill(NaN);
+
+                    let lastParams = { m1: null, m2: null, b: null };
+                    let isUpdating = false;
+
+                    // 預先生成樣本數據
+                    const samples = Array.from({length: 100}, () => {
+                        const x1 = Math.random() * 10;
+                        const x2 = Math.random() * 10;
+                        const y = 2 * x1 + 5 * x2 + 3;
+                        return {x1, x2, y};
+                    });
+
+                    // 初始化圖表
+                    const lossChart = new Chart(ctx, {
+                        type: 'line',
+                        data: {
+                            labels: steps,
+                            datasets: [{
+                                label: '與真實值的差距',
+                                data: losses,
+                                borderColor: 'rgba(75, 192, 192, 1)',
+                                backgroundColor: 'rgba(75, 192, 192, 0.2)',
+                                fill: false,
+                                borderWidth: 2,
+                            }]
+                        },
+                        options: {
+                            animation: false,
+                            responsive: true,
+                            maintainAspectRatio: false,
+                            scales: {
+                                x: {
+                                    title: {
+                                        display: true,
+                                        text: '調整次數 (steps)'
+                                    },
+                                    min: 1,
+                                    max: 1000
+                                },
+                                y: {
+                                    title: {
+                                        display: true,
+                                        text: '與真實值的差距 (loss)'
+                                    },
+                                    beginAtZero: true
+                                }
+                            }
+                        }
+                    });
+
+                    function calculateLoss() {
+                        const m1 = parseFloat(m1Slider.value);
+                        const m2 = parseFloat(m2Slider.value);
+                        const b = parseFloat(bSlider.value);
+
+                        let totalLoss = 0;
+                        for (const sample of samples) {
+                            const y2 = m1 * sample.x1 + m2 * sample.x2 + b;
+                            const loss = (y2 - sample.y) ** 2;
+                            totalLoss += loss;
+                        }
+
+                        return totalLoss / samples.length;
+                    }
+
+                    function updateChart() {
+                        const m1 = parseFloat(m1Slider.value);
+                        const m2 = parseFloat(m2Slider.value);
+                        const b = parseFloat(bSlider.value);
+
+                        // 只有當參數發生變化時才更新
+                        if (m1 !== lastParams.m1 || m2 !== lastParams.m2 || b !== lastParams.b) {
+                            if (!isUpdating) {
+                                step = 0;
+                                losses.fill(NaN);
+                            }
+                            step += 1;
+                            const loss = calculateLoss();
+                            
+                            m1Value.textContent = m1.toFixed(2);
+                            m2Value.textContent = m2.toFixed(2);
+                            bValue.textContent = b.toFixed(2);
+                            lossDisplay.textContent = loss.toFixed(2);
+
+                            losses[step - 1] = loss;
+
+                            lossChart.data.datasets[0].data = losses;
+                            lossChart.update('none');
+
+                            lastParams = { m1, m2, b };
+
+                            if (step >= 1000) {
+                                stopUpdate();
+                            }
+                        }
+                    }
+
+                    function startUpdate() {
+                        if (!isUpdating) {
+                            isUpdating = true;
+                            updateChart();
+                            requestAnimationFrame(continueUpdate);
+                        }
+                    }
+
+                    function continueUpdate() {
+                        if (isUpdating) {
+                            updateChart();
+                            requestAnimationFrame(continueUpdate);
+                        }
+                    }
+
+                    function stopUpdate() {
+                        isUpdating = false;
+                    }
+
+                    // 初始化 Plotly 圖表
+                    const plotlyLayout = {
+                        title: '100個房子資料與訓練的模型',
+                        scene: {
+                            xaxis: { title: '房間數', range: [0, 10] },
+                            yaxis: { title: '房間大小', range: [0, 10] },
+                            zaxis: { title: '房子價格(Ypredict)', range: [0, 80] }
+                        },
+                        margin: { l: 0, r: 0, b: 0, t: 40 }
+                    };
+
+                    Plotly.newPlot('plotly-container', [], plotlyLayout);
+
+                    function updatePlotly() {
+                        const m1 = parseFloat(m1Slider.value);
+                        const m2 = parseFloat(m2Slider.value);
+                        const b = parseFloat(bSlider.value);
+
+                        const x1 = samples.map(s => s.x1);
+                        const x2 = samples.map(s => s.x2);
+                        const y = samples.map(s => s.y);
+                        const y2 = samples.map(s => m1 * s.x1 + m2 * s.x2 + b);
+
+                        const trace1 = {
+                            x: x2, y: x1, z: y,
+                            mode: 'markers',
+                            marker: { size: 5, color: 'blue' },
+                            type: 'scatter3d',
+                            name: '取樣點'
+                        };
+
+                        const x1Range = Array.from({length: 20}, (_, i) => i / 2);
+                        const x2Range = Array.from({length: 20}, (_, i) => i / 2);
+
+                        const predictedZ = x1Range.map(x1 => 
+                            x2Range.map(x2 => m1 * x1 + m2 * x2 + b)
+                        );
+
+                        const trace3 = {
+                            x: x1Range, y: x2Range, z: predictedZ,
+                            type: 'surface',
+                            opacity: 0.5,
+                            colorscale: [[0, 'rgba(255, 0, 0, 0.5)'], [1, 'rgba(255, 0, 0, 0.5)']],
+                            showscale: false,
+                            name: '訓練的模型平面'
+                        };
+
+                        Plotly.react('plotly-container', [trace1, trace3], plotlyLayout);
+                    }
+
+                    // 使用節流函數來限制更新頻率
+                    function throttle(func, limit) {
+                        let inThrottle;
+                        return function() {
+                            const args = arguments;
+                            const context = this;
+                            if (!inThrottle) {
+                                func.apply(context, args);
+                                inThrottle = true;
+                                setTimeout(() => inThrottle = false, limit);
+                            }
+                        }
+                    }
+
+                    const throttledUpdatePlotly = throttle(updatePlotly, 50);  // 50ms 的節流時間
+
+                    // 添加事件監聽器
+                    [m1Slider, m2Slider, bSlider].forEach(slider => {
+                        slider.addEventListener('input', () => {
+                            startUpdate();
+                            throttledUpdatePlotly();  // 在滑塊移動時更新 3D 圖
+                        });
+                        slider.addEventListener('change', stopUpdate);
+                    });
+
+                    // 初始更新
+                    updatePlotly();
+
+                } catch (error) {
+                    console.error('Error in main function:', error);
+                    loadingElement.style.display = 'none';
+                    errorMessageElement.textContent = `加載出錯: ${error.message}`;
+                }
+            }
+
+            // 啟動主程序
+            main().catch(error => {
+                console.error('Unhandled error in main:', error);
+                loadingElement.style.display = 'none';
+                errorMessageElement.textContent = `未處理的錯誤: ${error.message}`;
+            });
+        });
+    </script>
+</body>
+</html>
